@@ -36,7 +36,7 @@ class MultiHeadAttention(nn.Module):
         attentions = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
         # применяем маску
-        if mask:
+        if mask is not None:
             attentions = attentions.masked_fill(mask == 0, -1e9)
 
         # вычисляем веса
@@ -62,23 +62,23 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(positions * div_term)
         pe[:, 1::2] = torch.cos(positions * div_term)
 
-        pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0).transpose(0, 1)
 
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         # поэлементное сложение последовательности с позиционными кодировками
-        return x + self.pe[:x.size(1), :].transpose(0, 1)
+        return x + self.pe[:x.size(1), :].squeeze(1)
     
 class FFN(nn.Module):
     def __init__(self, model_dim, ff_dim, dropout=0.1):
         super().__init__()
-        self.linear1 = nn.Linear(model_dim)
-        self.linear2 = nn.Linear(model_dim)
+        self.linear1 = nn.Linear(model_dim, ff_dim)
+        self.linear2 = nn.Linear(ff_dim, model_dim)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.ReLU()
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         return self.linear2(self.dropout(self.activation(self.linear1(x))))
 
 class TransformetBlock(nn.Module):
@@ -103,7 +103,46 @@ class TransformetBlock(nn.Module):
         x = x + self.dropout(ffn_output)
 
         return x
-    
+
+class DecoderLayer(nn.Module):
+    def __init__(self, model_dim, num_heads, ff_dim, dropout=0.1):
+        super().__init__()
+        self.self_attention = MultiHeadAttention(model_dim, num_heads, dropout)
+        self.cross_attention = MultiHeadAttention(model_dim, num_heads, dropout)
+        self.feed_forward = FFN(model_dim, ff_dim, dropout)
+        
+        # LayerNorm для каждого sub-layer
+        self.self_attention_norm = nn.LayerNorm(model_dim)
+        self.cross_attention_norm = nn.LayerNorm(model_dim)
+        self.ffn_norm = nn.LayerNorm(model_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, encoder_output, src_mask=None, tgt_mask=None):
+        # 1. Self-attention (маскированная)
+        self_attn_output = self.self_attention(
+            self.self_attention_norm(x),
+            self.self_attention_norm(x), 
+            self.self_attention_norm(x),
+            tgt_mask
+        )
+        x = x + self.dropout(self_attn_output)  # Residual connection
+
+        # 2. Cross-attention (Q из декодера, K,V из энкодера)
+        cross_attn_output = self.cross_attention(
+            self.cross_attention_norm(x),           # Q: из декодера
+            self.cross_attention_norm(encoder_output), # V: из энкодера  
+            self.cross_attention_norm(encoder_output), # K: из энкодера
+            src_mask
+        )
+        x = x + self.dropout(cross_attn_output)  # Residual connection
+
+        # 3. Feed Forward Network
+        ffn_output = self.feed_forward(self.ffn_norm(x))
+        x = x + self.dropout(ffn_output)  # Residual connection
+
+        return x
+      
 class Transformer(pl.LightningModule):
     def __init__(
             self, 
@@ -119,6 +158,7 @@ class Transformer(pl.LightningModule):
         ):
         super().__init__()
         self.save_hyperparameters()
+        self.model_dim = model_dim 
 
         # ENCODER
         self.src_embedding = nn.Embedding(src_vocab_size, model_dim)
@@ -134,20 +174,31 @@ class Transformer(pl.LightningModule):
         self.target_pos_encoding = PositionalEncoding(model_dim, max_seq_len)
         
         self.decoder_layers = nn.ModuleList([
-            TransformetBlock(model_dim, num_heads, ff_dim, dropout)
+            DecoderLayer(model_dim, num_heads, ff_dim, dropout)
             for _ in range(num_layers)
         ])
-
-        self.self_attention = MultiHeadAttention(model_dim, num_heads, dropout)
-        self.cross_attention = MultiHeadAttention(model_dim, num_heads, dropout)
-
-        self.self_attention_norm = nn.LayerNorm(model_dim)
-        self.cross_attention_norm = nn.LayerNorm(model_dim)
 
         self.dropout = nn.Dropout(dropout)
         self.learning_rate = learning_rate
 
         self.output_layer = nn.Linear(model_dim, target_vocab_size)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        nn.init.normal_(self.src_embedding.weight, mean=0, std=self.model_dim**-0.5)
+        nn.init.normal_(self.target_embedding.weight, mean=0, std=self.model_dim**-0.5)
+
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def encode(self, src, src_mask=None):
         src_emb = self.src_embedding(src) * math.sqrt(self.model_dim)
@@ -159,29 +210,18 @@ class Transformer(pl.LightningModule):
 
         return src_emb
     
-    def decode(self, target, encoder_output, target_mask=None, encoder_output_mask=None):
-        target_emb = self.src_embedding(target) * math.sqrt(self.model_dim)
-        target_emb = self.src_pos_encoding(target_emb)
+    def decode(self, target, encoder_output, target_mask=None, src_mask=None):
+        target_emb = self.target_embedding(target) * math.sqrt(self.model_dim)
+        target_emb = self.target_pos_encoding(target_emb)
         target_emb = self.dropout(target_emb)
 
-        self_attention = self.self_attention(
-            self.self_attention_norm(target_emb),
-            self.self_attention_norm(target_emb),
-            self.self_attention_norm(target_emb),
-            target_mask
-        )
-        target_emb = target_emb + self.dropout(self_attention)
-
-        cross_attention = self.cross_attention(
-            self.cross_attention_norm(target_emb), # Q
-            self.cross_attention_norm(encoder_output), # V (encoder)
-            self.cross_attention_norm(encoder_output), # K (encoder)
-            encoder_output_mask
-        )
-        target_emb = target_emb + self.dropout(cross_attention)
-
-        for l in self.decoder_layers:
-            target_emb = l(target_emb, target_mask)
+        for layer in self.decoder_layers:
+            target_emb = layer(
+                target_emb,
+                encoder_output,
+                src_mask=src_mask,
+                tgt_mask=target_mask
+            )
 
         return self.output_layer(target_emb)
     

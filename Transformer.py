@@ -53,3 +53,41 @@ class PositionalEncoding(nn.Module):
     def __init__(self, model_dim, max_len=5000):
         super().__init__()
         
+        pe = torch.zeros(max_len, model_dim)
+        positions = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, model_dim, 2).float() *
+                             (-math.log(10000) / model_dim))
+        
+        pe[:, 0::2] = torch.sin(positions * div_term)
+        pe[:, 1::2] = torch.cos(positions * div_term)
+
+        pe.unsqueeze(0).transpose(0, 1)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # поэлементное сложение последовательности с позиционными кодировками
+        return x + self.pe[:x.size(1), :].transpose(0, 1)
+    
+class FFN(nn.Module):
+    def __init__(self, model_dim, num_heads, ff_dim, dropout=0.1):
+        super().__init__()
+
+        self.self_attention = MultiHeadAttention(model_dim, num_heads, dropout)
+        self.feed_forward = PositionalEncoding(model_dim)
+
+        self.attention_norm = nn.LayerNorm(model_dim)
+        self.ffn_norm = nn.LayerNorm(model_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        attention_output = self.self_attention(
+            self.attention_norm, # Q
+            self.attention_norm, # V
+            self.attention_norm, # K
+            mask
+        )
+
+        x = x + self.dropout(self.attention_norm(x)) # Residual Connection

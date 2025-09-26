@@ -71,23 +71,35 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(1), :].transpose(0, 1)
     
 class FFN(nn.Module):
+    def __init__(self, model_dim, ff_dim, dropout=0.1):
+        super().__init__()
+        self.linear1 = nn.Linear(model_dim)
+        self.linear2 = nn.Linear(model_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, x, mask=None):
+        return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
+class TransformetBlock(nn.Module):
     def __init__(self, model_dim, num_heads, ff_dim, dropout=0.1):
         super().__init__()
-
         self.self_attention = MultiHeadAttention(model_dim, num_heads, dropout)
         self.feed_forward = PositionalEncoding(model_dim)
-
         self.attention_norm = nn.LayerNorm(model_dim)
         self.ffn_norm = nn.LayerNorm(model_dim)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
         attention_output = self.self_attention(
-            self.attention_norm, # Q
-            self.attention_norm, # V
-            self.attention_norm, # K
+            self.attention_norm(x), # Q
+            self.attention_norm(x), # V
+            self.attention_norm(x), # K
             mask
         )
+        x = x + self.dropout(attention_output) # Residual Connection
 
-        x = x + self.dropout(self.attention_norm(x)) # Residual Connection
+        ffn_output = self.feed_forward(self.ffn_norm(x))
+        x = x + self.dropout(ffn_output)
+
+        return x
